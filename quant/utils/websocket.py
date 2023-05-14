@@ -13,52 +13,55 @@ import asyncio
 
 from quant.utils import logger
 from quant.config import config
-from quant.heartbeat import heartbeat
 
 
 class Websocket:
     """ websocket接口封装
     """
 
-    def __init__(self, url, check_conn_interval=10, send_hb_interval=10):
+    def __init__(self, url: str, ping_interval: int = 20, ping_timeout: int = 20):
         """ 初始化
         @param url 建立websocket的地址
-        @param check_conn_interval 检查websocket连接时间间隔
-        @param send_hb_interval 发送心跳时间间隔
+        @param ping_timeout 检查websocket连接时间间隔
+        @param ping_interval 发送心跳时间间隔
         """
-        self._url = url
-        self._ws = None  # websocket连接对象
-        self._check_conn_interval = check_conn_interval
-        self._send_hb_interval = send_hb_interval
-        self.heartbeat_msg = None  # 心跳消息
+        self.ws = None  # websocket连接对象
+        self.url = url
+        self._ping_interval = ping_interval
+        self._ping_timeout = ping_timeout
 
     def initialize(self):
         """ 初始化
         """
-        # 注册服务 检查连接是否正常
-        heartbeat.register(self._check_connection, self._check_conn_interval)
-        # 注册服务 发送心跳
-        heartbeat.register(self._send_heartbeat_msg, self._send_hb_interval)
         # 建立websocket连接
         asyncio.get_event_loop().create_task(self._connect())
 
     async def _connect(self):
-        logger.info("url:", self._url, caller=self)
-        proxy = config.proxy
-        session = aiohttp.ClientSession()
-        try:
-            self.ws = await session.ws_connect(self._url, proxy=proxy)
-        except aiohttp.client_exceptions.ClientConnectorError:
-            logger.error("connect to server error! url:", self._url, caller=self)
-            return
-        asyncio.get_event_loop().create_task(self.connected_callback())
-        asyncio.get_event_loop().create_task(self.receive())
+        async with aiohttp.ClientSession() as session:
+            while True:
+                try:
+                    logger.info("url:", self.url, caller=self)
+                    self.ws = await session.ws_connect(self.url,
+                                                       receive_timeout=self._ping_timeout,
+                                                       heartbeat=self._ping_interval)
+                    await self.connected_callback()
+                    async for msg in self.ws:
+                        try:
+                            data = json.loads(msg.data)
+                        except:
+                            data = msg.data
+                        finally:
+                            await self.process(data)
 
-    async def _reconnect(self):
-        """ 重新建立websocket连接
-        """
-        logger.warn("reconnecting websocket right now!", caller=self)
-        await self._connect()
+                    await self.disconnected_callback()
+
+                except Exception as error:
+                    print(f"error: {error}")
+                    pass
+                    logger.error("connect to server error! url:", self.url, caller=self)
+                finally:
+                    if self.ws:
+                        await self.ws.close()
 
     async def connected_callback(self):
         """ 连接建立成功的回调函数
@@ -66,26 +69,11 @@ class Websocket:
         """
         pass
 
-    async def receive(self):
-        """ 接收消息
+    async def disconnected_callback(self):
+        """ 连接建立成功的回调函数
+        * NOTE: 子类继承实现
         """
-        async for msg in self.ws:
-            if msg.type == aiohttp.WSMsgType.TEXT:
-                try:
-                    data = json.loads(msg.data)
-                except:
-                    data = msg.data
-                await asyncio.get_event_loop().create_task(self.process(data))
-            elif msg.type == aiohttp.WSMsgType.BINARY:
-                await asyncio.get_event_loop().create_task(self.process_binary(msg.data))
-            elif msg.type == aiohttp.WSMsgType.CLOSED:
-                logger.warn("receive event CLOSED:", msg, caller=self)
-                await asyncio.get_event_loop().create_task(self._reconnect())
-                return
-            elif msg.type == aiohttp.WSMsgType.ERROR:
-                logger.error("receive event ERROR:", msg, caller=self)
-            else:
-                logger.warn("unhandled msg:", msg, caller=self)
+        pass
 
     async def process(self, msg):
         """ 处理websocket上接收到的消息 text 类型
@@ -93,32 +81,24 @@ class Websocket:
         """
         raise NotImplementedError
 
-    async def process_binary(self, msg):
-        """ 处理websocket上接收到的消息 binary类型
-        * NOTE: 子类继承实现
-        """
-        raise NotImplementedError
+    async def send(self, data) -> bool:
+        """ Send message to Websocket server.
 
-    async def _check_connection(self, *args, **kwargs):
-        """ 检查连接是否正常
+        Args:
+            data: Message content, must be dict or string.
+
+        Returns:
+            If send successfully, return True, otherwise return False.
         """
-        # 检查websocket连接是否关闭，如果关闭，那么立即重连
         if not self.ws:
-            logger.warn("websocket connection not connected yet!", caller=self)
-            return
-        if self.ws.closed:
-            await asyncio.get_event_loop().create_task(self._reconnect())
-            return
-
-    async def _send_heartbeat_msg(self, *args, **kwargs):
-        """ 发送心跳给服务器
-        """
-        if self.heartbeat_msg:
-            if isinstance(self.heartbeat_msg, dict):
-                await self.ws.send_json(self.heartbeat_msg)
-            elif isinstance(self.heartbeat_msg, str):
-                await self.ws.send_str(self.heartbeat_msg)
-            else:
-                logger.error("send heartbeat msg failed! heartbeat msg:", self.heartbeat_msg, caller=self)
-                return
-            logger.debug("send ping message:", self.heartbeat_msg, caller=self)
+            logger.warn("Websocket connection not connected yet!", caller=self)
+            return False
+        if isinstance(data, dict):
+            await self.ws.send_json(data)
+        elif isinstance(data, str):
+            await self.ws.send_str(data)
+        else:
+            logger.error("send message failed:", data, caller=self)
+            return False
+        logger.debug("send message:", data, caller=self)
+        return True
